@@ -356,3 +356,62 @@ fn check_test_environment() {
     #[cfg(target_os = "linux")]
     fn test_iface() {}
 }
+
+#[cfg(windows)]
+#[test]
+fn packet_api_test() {
+    use bindings::winpcap::*;
+    use std::old_io::IoError;
+    use std::ffi::CString;
+
+    // Saves typing
+    fn last_error() -> IoError {
+        IoError::last_error()
+    }
+
+    const READ_BUFFER_SIZE: usize = 512_000; 
+
+    let mut buffer = Vec::new();
+    buffer.resize(READ_BUFFER_SIZE, 0u8);
+    
+    let iface = ::std::env::var_string("PNET_TEST_IFACE").unwrap();
+
+    let adapter = unsafe {
+        let net_if_str = CString::from_slice(iface.as_bytes());
+        PacketOpenAdapter(net_if_str.as_ptr() as *mut i8)
+    };
+
+    assert!(!adapter.is_null(), "Error creating adapter (iface: {}): {}", iface, last_error());
+
+    assert!(
+        unsafe { PacketSetHwFilter(adapter, NDIS_PACKET_TYPE_PROMISCUOUS) } != 0, 
+        "Error setting HW filter: {}", last_error()
+    );
+
+    assert!(
+        unsafe { PacketSetBuff(adapter, READ_BUFFER_SIZE as i32) } != 0,
+        "Error setting packet buffer: {}", last_error()
+    );
+
+    assert!(
+        unsafe { PacketSetReadTimeout(adapter, 1000) } != 0,
+        "Error setting packet read timeout: {}", last_error()
+    );
+
+    let packet = unsafe { PacketAllocatePacket() };
+    assert!(!packet.is_null(), "Null pointer returned: {}", last_error());
+
+    unsafe { PacketInitPacket(packet, buffer.as_mut_ptr() as PVOID, READ_BUFFER_SIZE as UINT) }
+
+    // Do the assert after cleanup
+    let packet_received = unsafe { PacketReceivePacket(adapter, packet, 0) } != 0;
+
+    unsafe {
+        PacketFreePacket(packet);
+        PacketCloseAdapter(adapter);
+    }
+
+    assert!(packet_received, "No packet received!");
+
+}
+
