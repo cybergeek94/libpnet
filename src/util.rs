@@ -10,6 +10,7 @@
 
 use bindings::libc;
 
+use std::borrow::ToOwned;
 use std::fmt;
 use std::str::FromStr;
 use std::mem;
