@@ -22,14 +22,41 @@ use old_packet::Packet;
 use old_packet::ethernet::{EthernetHeader, MutableEthernetHeader};
 use util::NetworkInterface;
 
+/// Evaluate the expression as a pointer and test if it is `NULL`.
+/// If so, return `Err(IoError::last_error())`, the pointer otherwise.
+macro_rules! try_get_ptr(
+    ($get_ptr:expr) => (
+        {
+            let ptr = $get_ptr;
+            if ptr.is_null() {
+                return Err(IoError::last_error());
+            }
+
+            ptr
+        }
+    )
+);
+
+/// Evaluate the expression in an `unsafe` block as an integer and test if it is 0.
+/// If so, return `Err(IoError::last_error())`.
+macro_rules! try_ffi_unsafe {
+    ($ffi_expr:expr) => (
+        if unsafe { $ffi_expr } == 0 {
+            return Err(IoError::last_error());
+        }
+    )
+}
+
 struct WinPcapAdapter {
     adapter: winpcap::LPADAPTER,
 }
 
 impl Drop for WinPcapAdapter {
     fn drop(&mut self) {
-        unsafe {
-            winpcap::PacketCloseAdapter(self.adapter);
+        if !self.adapter.is_null(){
+            unsafe {
+                winpcap::PacketCloseAdapter(self.adapter);
+            }
         }
     }
 }
@@ -38,10 +65,30 @@ struct WinPcapPacket {
     packet: winpcap::LPPACKET,
 }
 
+impl WinPcapPacket {
+    fn with_buf(buf: &mut [u8]) -> IoResult<WinPcapPacket> {
+        let packet = try_get_ptr!(unsafe { winpcap::PacketAllocatePacket() });
+
+        unsafe {
+            winpcap::PacketInitPacket(
+                packet,
+                buf.as_mut_ptr() as winpcap::PVOID,
+                buf.len() as winpcap::UINT
+            )
+        }
+
+        Ok(WinPcapPacket { 
+            packet: packet,
+        })
+    }
+}
+
 impl Drop for WinPcapPacket {
     fn drop(&mut self) {
-        unsafe {
-            winpcap::PacketFreePacket(self.packet);
+        if !self.packet.is_null() {
+            unsafe {
+                winpcap::PacketFreePacket(self.packet);
+            }
         }
     }
 }
@@ -57,86 +104,51 @@ pub fn datalink_channel(network_interface: &NetworkInterface,
     let mut write_buffer = Vec::new();
     write_buffer.resize(write_buffer_size, 0u8);
 
-    let adapter = unsafe {
-        let net_if_str = CString::from_slice(network_interface.name.as_bytes());
-        winpcap::PacketOpenAdapter(net_if_str.as_ptr() as *mut libc::c_char)
+    // Take advantage of RAII by creating this now.
+    let adapter = WinPcapAdapter { 
+        adapter: try_get_ptr!(unsafe {
+            let net_if_str = CString::from_slice(network_interface.name.as_bytes());
+            winpcap::PacketOpenAdapter(net_if_str.as_ptr() as *mut libc::c_char)
+        }),
     };
-    if adapter.is_null() {
-        return Err(IoError::last_error());
-    }
 
-    let ret = unsafe {
-        winpcap::PacketSetHwFilter(adapter, winpcap::NDIS_PACKET_TYPE_PROMISCUOUS)
-    };
-    if ret == 0 {
-        return Err(IoError::last_error());
+    try_ffi_unsafe! {
+        winpcap::PacketSetHwFilter(adapter.adapter, winpcap::NDIS_PACKET_TYPE_PROMISCUOUS)
     }
 
     // Set kernel buffer size
-    let ret = unsafe {
-        winpcap::PacketSetBuff(adapter, read_buffer_size as libc::c_int)
-    };
-    if ret == 0 {
-        return Err(IoError::last_error());
+    try_ffi_unsafe! {
+        winpcap::PacketSetBuff(adapter.adapter, read_buffer_size as libc::c_int)
     }
 
     // FIXME [windows] causes "os error 31: a device atteched to the system is not functioning"
     // FIXME [windows] This shouldn't be here - on Win32 reading seems to block indefinitely
     //       currently.
-    let ret = unsafe {
-        winpcap::PacketSetReadTimeout(adapter, 5000)
-    };
-    if ret == 0 {
-        return Err(IoError::last_error());
+    /*
+    try_ffi_unsafe! {
+        winpcap::PacketSetReadTimeout(adapter, 1000)
     }
+    */
 
     // Immediate mode
-    let ret = unsafe {
-        winpcap::PacketSetMinToCopy(adapter, 1)
-    };
-    if ret == 0 {
-        return Err(IoError::last_error());
-    }
+    try_ffi_unsafe! {
+        winpcap::PacketSetMinToCopy(adapter.adapter, 1)
+    }   
 
-    let read_packet = unsafe { winpcap::PacketAllocatePacket() };
-    if read_packet.is_null() {
-        unsafe {
-            winpcap::PacketCloseAdapter(adapter);
-        }
-        return Err(IoError::last_error());
-    }
+    let read_packet = try!(WinPcapPacket::with_buf(&mut *read_buffer));
 
-    unsafe {
-        winpcap::PacketInitPacket(read_packet,
-                                  read_buffer.as_mut_ptr() as winpcap::PVOID,
-                                  read_buffer_size as winpcap::UINT)
-    }
+    let write_packet = try!(WinPcapPacket::with_buf(&mut *write_buffer)); 
 
-    let write_packet = unsafe { winpcap::PacketAllocatePacket() };
-    if write_packet.is_null() {
-        unsafe {
-            winpcap::PacketFreePacket(read_packet);
-            winpcap::PacketCloseAdapter(adapter);
-        }
-        return Err(IoError::last_error());
-    }
-
-    unsafe {
-        winpcap::PacketInitPacket(write_packet,
-                                  write_buffer.as_mut_ptr() as winpcap::PVOID,
-                                  write_buffer_size as winpcap::UINT)
-    }
-
-    let adapter = Arc::new(WinPcapAdapter { adapter: adapter });
+    let adapter = Arc::new(adapter);
     let sender = DataLinkSenderImpl {
         adapter: adapter.clone(),
         _vec: write_buffer,
-        packet: WinPcapPacket { packet: write_packet }
+        packet: write_packet,
     };
     let receiver = DataLinkReceiverImpl {
         adapter: adapter,
         _vec: read_buffer,
-        packet: WinPcapPacket { packet: read_packet }
+        packet: read_packet,
     };
     Ok((sender, receiver))
 }
