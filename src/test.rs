@@ -289,8 +289,8 @@ fn layer2() {
     let (tx, rx) = channel();
 
     let dlc = datalink_channel(&interface,
-                               MIN_PACKET_SIZE*2,
-                               MIN_PACKET_SIZE*2,
+                               512_000,//MIN_PACKET_SIZE*2,
+                               512_000,//MIN_PACKET_SIZE*2,
                                DataLinkChannelType::Layer2);
     let (mut dltx, mut dlrx) = match dlc {
         Ok((tx, rx)) => (tx, rx),
